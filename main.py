@@ -4,8 +4,11 @@ import math
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
+
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans
+from sklearn.metrics import silhouette_score
 
 
 # ==================================================
@@ -29,7 +32,9 @@ FEATURES = {
     "롱런 지수": "longrun_index",
 }
 
-CLUSTER_LABELS = ["㉮", "㉯", "㉰"]
+CLUSTER_SYMBOLS = [
+    "㉮", "㉯", "㉰", "㉱", "㉲", "㉳", "㉴"
+]
 
 
 # ==================================================
@@ -37,8 +42,8 @@ CLUSTER_LABELS = ["㉮", "㉯", "㉰"]
 # ==================================================
 st.title("🎬 영화 유형 나누기")
 st.caption(
-    "영화 데이터를 분석해 비슷한 특성을 가진 영화들을 "
-    "K-평균 알고리즘으로 세 가지 유형으로 나눕니다."
+    "영화 데이터를 분석하고 K-평균 알고리즘으로 "
+    "비슷한 특성을 가진 영화들을 유형별로 분류합니다."
 )
 
 st.divider()
@@ -79,7 +84,6 @@ def load_data():
 
     df = df.copy()
 
-    # 숫자형 데이터로 변환할 열
     numeric_columns = [
         "first_scrn",
         "first_show",
@@ -98,14 +102,12 @@ def load_data():
             errors="coerce",
         )
 
-    # 영화 제목이 없는 행 제외
+    # 제목이 없는 행 제외
     df = df.dropna(subset=["movieNm"]).copy()
 
-    # 데이터에 들어 있는 전체 영화 편수
     total_count = len(df)
 
     # 스크린 수와 누적 관객에 상용로그 적용
-    # 로그는 양수에 대해서만 계산
     df["log_first_scrn"] = df["first_scrn"].apply(
         lambda x: math.log10(x)
         if pd.notna(x) and x > 0
@@ -119,7 +121,6 @@ def load_data():
     )
 
     # 롱런 지수 = 누적 관객 / 첫 주 관객
-    # 첫 주 관객이 0이면 분석에서 제외
     df["longrun_index"] = float("nan")
 
     valid_first_week = (
@@ -132,10 +133,9 @@ def load_data():
         / df.loc[valid_first_week, "first_week_audi"]
     )
 
-    # 롱런 지수는 최대 20
+    # 롱런 지수 최대 20
     df["longrun_index"] = df["longrun_index"].clip(upper=20)
 
-    # 네 가지 속성 중 결측치가 있으면 제외
     feature_columns = [
         "log_first_scrn",
         "log_total_audi",
@@ -150,7 +150,7 @@ def load_data():
         & (df["total_audi"] > 0)
     )
 
-    clean_df = df.loc[valid_mask].copy()
+    clean_df = df.loc[valid_mask].copy().reset_index(drop=True)
 
     return clean_df, total_count
 
@@ -169,27 +169,36 @@ st.write(
 )
 
 st.caption(
-    "네 가지 속성 중 결측치가 있는 영화, 첫 주 관객이 0인 영화, "
+    "필요한 속성에 결측치가 있거나 첫 주 관객이 0인 영화, "
     "로그 계산이 불가능한 영화는 분석에서 제외합니다."
 )
 
 if len(df) < 3:
-    st.error("군집화를 하려면 분석 가능한 영화가 최소 3편 필요합니다.")
+    st.error("분석 가능한 영화가 최소 3편 필요합니다.")
     st.stop()
 
 st.divider()
 
 
 # ==================================================
-# 4. 군집화 속성 선택
+# 4. 군집화 속성 및 군집 수 선택
 # ==================================================
-st.subheader("1. 영화 유형을 나눌 기준")
+st.subheader("1. 군집화 설정")
 
 selected_features = st.multiselect(
-    "군집화에 사용할 속성을 선택하세요.",
+    "군집화에 사용할 속성",
     options=list(FEATURES.keys()),
     default=list(FEATURES.keys()),
-    help="두 개 이상 선택해야 합니다. 기본값은 네 가지 속성 전체입니다.",
+    help="두 개 이상 선택하세요. 기본값은 네 가지 속성 전체입니다.",
+)
+
+max_clusters = min(7, len(df))
+
+selected_k = st.selectbox(
+    "군집 수",
+    options=list(range(2, max_clusters + 1)),
+    index=min(3, max_clusters - 2),
+    help="2개부터 7개까지 선택할 수 있습니다. 기본값은 3개입니다.",
 )
 
 if len(selected_features) < 2:
@@ -202,22 +211,142 @@ feature_columns = [
 
 
 # ==================================================
-# 5. 표준화 및 K-평균 군집화
+# 5. 선택한 속성 표준화
 # ==================================================
 X = df[feature_columns].copy()
 
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 
+
+# ==================================================
+# 6. WCSS 계산: 군집 수 1~7
+# ==================================================
+st.divider()
+st.subheader("2. 적절한 군집 수 찾기 - 엘보 그래프")
+
+wcss_values = []
+
+for k in range(1, max_clusters + 1):
+    model = KMeans(
+        n_clusters=k,
+        random_state=42,
+        n_init=10,
+    )
+
+    model.fit(X_scaled)
+
+    # inertia_ = 군집 중심과 각 데이터 점 사이의
+    # 제곱 거리 합(WCSS)
+    wcss_values.append({
+        "군집 수": k,
+        "WCSS": float(model.inertia_),
+    })
+
+wcss_df = pd.DataFrame(wcss_values)
+
+fig_wcss = go.Figure()
+
+fig_wcss.add_trace(
+    go.Scatter(
+        x=wcss_df["군집 수"],
+        y=wcss_df["WCSS"],
+        mode="lines+markers",
+        name="WCSS",
+        line=dict(width=3),
+        marker=dict(size=8),
+        hovertemplate=(
+            "군집 수: %{x}"
+            "<br>WCSS: %{y:,.3f}"
+            "<extra></extra>"
+        ),
+    )
+)
+
+# 현재 선택한 군집 수에 세로선 표시
+fig_wcss.add_vline(
+    x=selected_k,
+    line_dash="dash",
+    line_width=2,
+    annotation_text=f"현재 선택: {selected_k}개",
+    annotation_position="top",
+)
+
+fig_wcss.update_layout(
+    title="군집 수에 따른 WCSS 변화",
+    xaxis_title="군집 수",
+    yaxis_title="군집 내 제곱 거리 합 (WCSS)",
+    xaxis=dict(
+        tickmode="linear",
+        dtick=1,
+    ),
+    height=470,
+    margin=dict(l=20, r=20, t=80, b=30),
+    hovermode="x unified",
+)
+
+st.plotly_chart(fig_wcss, use_container_width=True)
+
+st.markdown(
+    """
+    **그래프 해석 방법**
+
+    - WCSS는 같은 군집에 속한 점들이 각 군집 중심에서 얼마나 떨어져 있는지를 나타냅니다.
+    - 군집 수가 증가하면 일반적으로 WCSS는 감소합니다.
+    - 그래프의 감소 폭이 크게 줄어드는 지점은 군집 수를 결정할 때 참고할 수 있습니다.
+    - WCSS가 가장 작은 군집 수가 반드시 가장 좋은 선택이라는 뜻은 아닙니다.
+    """
+)
+
+# WCSS 및 직전 군집 수와의 차이
+wcss_table = wcss_df.copy()
+wcss_table["직전 값 대비 감소량"] = (
+    wcss_table["WCSS"].shift(1) - wcss_table["WCSS"]
+)
+
+# 첫 행은 비교 대상이 없으므로 빈칸
+wcss_table["직전 값 대비 감소량"] = (
+    wcss_table["직전 값 대비 감소량"].round(3)
+)
+wcss_table.loc[0, "직전 값 대비 감소량"] = float("nan")
+
+wcss_table["WCSS"] = wcss_table["WCSS"].round(3)
+
+st.dataframe(
+    wcss_table,
+    use_container_width=True,
+    hide_index=True,
+    column_config={
+        "군집 수": st.column_config.NumberColumn(
+            "군집 수",
+            format="%d개",
+        ),
+        "WCSS": st.column_config.NumberColumn(
+            "WCSS",
+            format="%,.3f",
+        ),
+        "직전 값 대비 감소량": st.column_config.NumberColumn(
+            "직전 값 대비 감소량",
+            format="%,.3f",
+        ),
+    },
+)
+
+st.divider()
+
+
+# ==================================================
+# 7. 선택한 군집 수로 K-평균 실행
+# ==================================================
 kmeans = KMeans(
-    n_clusters=3,
+    n_clusters=selected_k,
     random_state=42,
     n_init=10,
 )
 
 df["cluster_raw"] = kmeans.fit_predict(X_scaled)
 
-# 누적 관객 평균이 높은 군집부터 이름 부여
+# 누적 관객 평균이 높은 군집부터 표시 기호 지정
 cluster_means = (
     df.groupby("cluster_raw")["total_audi"]
     .mean()
@@ -227,24 +356,68 @@ cluster_means = (
 cluster_order = cluster_means.index.tolist()
 
 label_map = {
-    cluster_id: CLUSTER_LABELS[index]
+    cluster_id: CLUSTER_SYMBOLS[index]
     for index, cluster_id in enumerate(cluster_order)
 }
 
 df["유형"] = df["cluster_raw"].map(label_map)
 
+active_labels = CLUSTER_SYMBOLS[:selected_k]
+
+
+# ==================================================
+# 8. 실루엣 점수
+# ==================================================
+st.subheader("3. 현재 군집화의 실루엣 점수")
+
+try:
+    if len(set(df["cluster_raw"])) < 2:
+        silhouette = float("nan")
+    elif len(set(df["cluster_raw"])) >= len(df):
+        silhouette = float("nan")
+    else:
+        silhouette = silhouette_score(
+            X_scaled,
+            df["cluster_raw"],
+        )
+
+    if pd.notna(silhouette):
+        st.write(
+            f"**선택한 군집 수: {selected_k}개**"
+            f"　|　**실루엣 점수: {silhouette:.4f}**"
+        )
+
+        st.progress(
+            max(0.0, min(1.0, (silhouette + 1) / 2))
+        )
+
+        st.caption(
+            "실루엣 점수는 -1부터 1 사이입니다. "
+            "1에 가까울수록 각 영화가 자기 군집에 잘 속하고 "
+            "다른 군집과 잘 구분되는 경향이 있습니다. "
+            "0에 가까우면 군집이 겹칠 수 있으며, "
+            "음수이면 일부 영화가 다른 군집에 더 가까울 수 있습니다."
+        )
+    else:
+        st.warning(
+            "현재 데이터로 실루엣 점수를 계산할 수 없습니다."
+        )
+
+except Exception as e:
+    st.warning(f"실루엣 점수 계산 중 문제가 발생했습니다: {e}")
+
 st.info(
-    "군집 이름은 누적 관객 평균이 높은 순서로 "
-    "㉮, ㉯, ㉰를 부여했습니다."
+    f"현재 **{selected_k}개 군집**으로 분석하고 있습니다. "
+    "유형 이름은 누적 관객 평균이 높은 순서로 표시합니다."
 )
 
 st.divider()
 
 
 # ==================================================
-# 6. 2차원 산점도
+# 9. 2차원 산점도
 # ==================================================
-st.subheader("2. 2차원 산점도")
+st.subheader("4. 2차원 산점도")
 
 col_x, col_y = st.columns(2)
 
@@ -269,7 +442,7 @@ fig_2d = px.scatter(
     x=FEATURES[x_feature],
     y=FEATURES[y_feature],
     color="유형",
-    category_orders={"유형": CLUSTER_LABELS},
+    category_orders={"유형": active_labels},
     hover_name="movieNm",
     hover_data={
         "유형": True,
@@ -298,17 +471,17 @@ fig_2d.update_layout(
 st.plotly_chart(fig_2d, use_container_width=True)
 
 st.caption(
-    "점 하나가 영화 한 편입니다. 점 위에 마우스를 올리면 "
-    "영화 제목과 속성 값을 확인할 수 있습니다."
+    "점 하나가 영화 한 편입니다. 마우스를 올리면 영화 제목과 "
+    "선택한 두 속성의 값을 확인할 수 있습니다."
 )
 
 st.divider()
 
 
 # ==================================================
-# 7. 3차원 산점도
+# 10. 3차원 산점도
 # ==================================================
-st.subheader("3. 3차원 산점도")
+st.subheader("5. 3차원 산점도")
 
 if len(selected_features) < 3:
     st.info(
@@ -348,7 +521,7 @@ else:
         y=FEATURES[y3],
         z=FEATURES[z3],
         color="유형",
-        category_orders={"유형": CLUSTER_LABELS},
+        category_orders={"유형": active_labels},
         hover_name="movieNm",
         hover_data={
             "유형": True,
@@ -385,18 +558,17 @@ else:
 
     st.caption(
         "마우스로 드래그해 그래프를 회전할 수 있습니다. "
-        "점 위에 마우스를 올리면 영화 제목을 확인할 수 있습니다."
+        "점에 마우스를 올리면 영화 제목을 확인할 수 있습니다."
     )
 
 st.divider()
 
 
 # ==================================================
-# 8. 유형별 통계
+# 11. 유형별 통계
 # ==================================================
-st.subheader("4. 유형별 통계")
+st.subheader("6. 유형별 통계")
 
-# 한글 별칭 대신 영문 이름을 사용해 문법 오류 방지
 stats = (
     df.groupby("유형")
     .agg(
@@ -406,10 +578,9 @@ stats = (
         avg_days_in_top10=("days_in_top10", "mean"),
         avg_longrun_index=("longrun_index", "mean"),
     )
-    .reindex(CLUSTER_LABELS)
+    .reindex(active_labels)
 )
 
-# 화면에 표시할 한글 열 이름
 stats_display = stats.rename(
     columns={
         "movie_count": "영화 편수",
@@ -446,19 +617,19 @@ st.dataframe(
 )
 
 st.caption(
-    "스크린 수와 누적 관객은 로그 변환 전의 원래 단위로 평균을 계산합니다. "
-    "롱런 지수는 영화별 계산값을 사용합니다."
+    "스크린 수와 누적 관객 평균은 로그 변환 전의 원래 단위입니다. "
+    "군집 수를 바꾸면 이 표도 다시 계산됩니다."
 )
 
 st.divider()
 
 
 # ==================================================
-# 9. 유형별 누적 관객 TOP 5
+# 12. 유형별 누적 관객 TOP 5
 # ==================================================
-st.subheader("5. 유형별 대표 영화 TOP 5")
+st.subheader("7. 유형별 대표 영화 TOP 5")
 
-for label in CLUSTER_LABELS:
+for label in active_labels:
     group_df = df[df["유형"] == label].copy()
 
     group_df = group_df.sort_values(
@@ -538,22 +709,24 @@ st.divider()
 
 
 # ==================================================
-# 10. 분석 안내
+# 13. 분석 방법
 # ==================================================
 st.subheader("분석 방법")
 
 st.markdown(
     """
-    1. **데이터 전처리:** 분석 속성에 결측치가 있는 영화 등을 제외합니다.
+    1. **데이터 전처리:** 필요한 속성에 결측치가 있는 영화를 제외합니다.
     2. **속성 변환:** 스크린 수와 누적 관객에 상용로그를 적용합니다.
     3. **롱런 지수 계산:** 누적 관객을 첫 주 관객으로 나누고 최대 20으로 제한합니다.
-    4. **표준화:** 선택한 속성의 평균과 표준편차를 이용해 표준화합니다.
-    5. **군집화:** K-평균 알고리즘으로 영화들을 세 유형으로 분류합니다.
-    6. **유형 이름 지정:** 누적 관객 평균이 높은 군집부터 ㉮, ㉯, ㉰로 표시합니다.
+    4. **표준화:** 선택한 속성을 표준화해 단위 차이를 줄입니다.
+    5. **군집 수 비교:** 1~7개 군집의 WCSS를 계산해 엘보 그래프로 비교합니다.
+    6. **군집화:** 선택한 군집 수로 K-평균을 실행합니다.
+    7. **군집 평가:** 실루엣 점수로 군집의 분리 정도를 확인합니다.
+    8. **유형 표시:** 누적 관객 평균이 높은 군집부터 ㉮, ㉯, ㉰, ㉱, ㉲, ㉳, ㉴ 순으로 표시합니다.
     """
 )
 
 st.caption(
-    "같은 데이터와 같은 속성을 선택하면 random_state=42 설정으로 "
-    "군집화 결과를 재현할 수 있습니다."
+    "K-평균은 random_state=42와 n_init=10으로 설정했습니다. "
+    "같은 데이터와 같은 속성을 사용하면 결과를 재현할 수 있습니다."
 )
